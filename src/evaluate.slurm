@@ -48,4 +48,7 @@ umask 0027
 cd /scratch/pachary4/functional_competence/prompt_semantics/src
 unset CUDA_VISIBLE_DEVICES
 
+export WANDB_CACHE_DIR="/scratch/pachary4/.cache/wandb"
+export WANDB_DATA_DIR="/scratch/pachary4/.cache/wandb"
+
 python qwen_decoder_only.py

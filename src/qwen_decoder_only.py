@@ -1,7 +1,5 @@
 import os
 
-import weave
-
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import random
 
@@ -14,11 +12,11 @@ from transformers import AutoModelForCausalLM, Qwen2Tokenizer
 import wandb
 
 directory = os.path.dirname(os.getcwd())
-test_mode = True
+test_mode = False
 if test_mode:
     entity = "pacharya-george-mason-university"
     project = "qwen-rte-experiment"
-    weave.init(f"{entity}/{project}")
+    # weave.init(f"{entity}/{project}")
 else:
     entity = "gmu-nlp"
     project = "prompt-semantics-replication"
@@ -30,7 +28,7 @@ model_names = {
 }
 
 
-@weave.op()
+# @weave.op()
 def classify_response(response_text):
     """
     Classifies a model's response into one of three categories:
@@ -57,6 +55,52 @@ def classify_response(response_text):
         # If neither of the above, the response is invalid for our task
         return -1
 
+def classify_response_v3(response_text):
+    """
+    V3: A highly robust classifier that handles:
+    - Standard keywords ("entailment", "not entailment")
+    - Natural language variations ("is correct", "is false")
+    - Simple binary answers ("Yes", "No")
+    - Prompt echoing ("Answer: entailment")
+    - 0: Entailment
+    - 1: Not Entailment
+    - -1: Invalid / Malformed
+    """
+    response_lower = response_text.lower().strip()
+    
+    # --- Keywords for Not Entailment ---
+    # We check for these first as they are less ambiguous.
+    not_entailment_keywords = [
+        "not entailment",
+        "does not entail",
+        "is not correct",
+        "is false",
+        "is incorrect",
+        "cannot be inferred",
+        "no"  # Added "no"
+    ]
+    
+    # --- Keywords for Entailment ---
+    entailment_keywords = [
+        "entailment",
+        "is correct",
+        "is true",
+        "can be inferred",
+        "yes" # Added "yes"
+    ]
+    
+    # --- Logic ---
+    # Check for non-entailment first, as it's a stronger signal.
+    # This correctly handles cases like "Yes, but this is not entailment."
+    if any(keyword in response_lower for keyword in not_entailment_keywords):
+        return 1
+        
+    # Then check for entailment, ensuring no negations are present.
+    if any(keyword in response_lower for keyword in entailment_keywords) and "not" not in response_lower:
+        return 0
+        
+    # If neither of the above, the response is still considered invalid
+    return -1
 
 def run_experiment():
     # --- 0. Check for GPU ---
@@ -66,12 +110,13 @@ def run_experiment():
         )
 
     # --- 1. Configuration ---
-    model_name = model_names["qwen-7b-instruct"]
+    model_name = model_names["qwen-7b-base"]
     prompt_path = "/scratch/pachary4/functional_competence/prompt_semantics/data/binary_NLI_prompts.csv"
     dataset_name = "rte"
-    num_shots_list = [0, 4, 16]
-    seeds = [1, 2, 3]  # Use multiple seeds for robustness
-    max_new_tokens = 30
+    num_shots_list, seeds = [32], [1]
+    # num_shots_list = [0, 4, 16]
+    # seeds = [1, 2, 3]  # Use multiple seeds for robustness
+    max_new_tokens = 10
 
     job_id = os.environ.get("SLURM_JOB_ID")
     gpu_type = torch.cuda.get_device_name(0)
@@ -166,7 +211,7 @@ def run_experiment():
                             premise=train_ex["sentence1"],
                             hypothesis=train_ex["sentence2"],
                         )
-                        context += f"{example_text}{answer}\n\n"
+                        context += f"{example_text} Answer: {answer}\n\n"
 
                     # Use the prompt_template to format the final evaluation example
                     eval_text = prompt_template.format(
@@ -226,7 +271,7 @@ def run_experiment():
                         {
                             "prompt": prompt,
                             "num_shots": num_shots,
-                            "context": context,
+                            "prompt_template": prompt_template,
                             "premise": eval_example["sentence1"],
                             "hypothesis": eval_example["sentence2"],
                             "true_label": true_label,
@@ -280,9 +325,9 @@ def run_experiment():
 
     # --- 8. Save and Analyze Results ---
     results_df = pd.DataFrame(results)
-    # results_df.to_csv("qwen_rte_results.csv", index=False)
+    results_df.to_csv(f"{job_id}-qwen_rte_results.csv", index=False)
     wandb.log({"summary_results": wandb.Table(dataframe=results_df)})
-    # print("\nResults saved to qwen_rte_results.csv")
+    print(f"\nResults saved to {job_id}-qwen_rte_results.csv")
     # print("\n--- Average Accuracy per Prompt ---")
     # print(results_df.groupby("prompt")["accuracy"].mean())
     wandb.finish()
