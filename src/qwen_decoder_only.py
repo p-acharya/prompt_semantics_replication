@@ -1,18 +1,23 @@
 import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import json
 import random
 
 import pandas as pd
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, Qwen2Tokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedTokenizerFast,
+)
 
 import wandb
 
 directory = os.path.dirname(os.getcwd())
-test_mode = False
+test_mode = True
 if test_mode:
     entity = "pacharya-george-mason-university"
     project = "qwen-rte-experiment"
@@ -25,37 +30,11 @@ else:
 model_names = {
     "qwen-7b-base": "/projects/antonis/models/Qwen2.5/Qwen2.5-7B",
     "qwen-7b-instruct": "/projects/antonis/models/Qwen2.5-7B-Instruct",
+    "Meta-Llama-3.1-70B-Instruct-FP8": "/projects/antonis/models/Meta-Llama-3.1-70B-Instruct-FP8",
 }
 
 
-# @weave.op()
 def classify_response(response_text):
-    """
-    Classifies a model's response into one of three categories:
-    - 0: Entailment
-    - 1: Not Entailment
-    - -1: Invalid / Malformed
-    """
-    response_lower = response_text.lower()
-
-    # Check for a clear "entailment" prediction
-    is_entailment = (
-        "entailment" in response_lower and "not" not in response_lower
-    )
-
-    # Check for a clear "not entailment" prediction
-    is_not_entailment = "not entailment" in response_lower
-
-    # Use elif to ensure mutual exclusivity
-    if is_entailment:
-        return 0
-    elif is_not_entailment:
-        return 1
-    else:
-        # If neither of the above, the response is invalid for our task
-        return -1
-
-def classify_response_v3(response_text):
     """
     V3: A highly robust classifier that handles:
     - Standard keywords ("entailment", "not entailment")
@@ -67,7 +46,7 @@ def classify_response_v3(response_text):
     - -1: Invalid / Malformed
     """
     response_lower = response_text.lower().strip()
-    
+
     # --- Keywords for Not Entailment ---
     # We check for these first as they are less ambiguous.
     not_entailment_keywords = [
@@ -77,30 +56,44 @@ def classify_response_v3(response_text):
         "is false",
         "is incorrect",
         "cannot be inferred",
-        "no"  # Added "no"
+        "no",  # Added "no"
     ]
-    
+
     # --- Keywords for Entailment ---
     entailment_keywords = [
         "entailment",
         "is correct",
         "is true",
         "can be inferred",
-        "yes" # Added "yes"
+        "yes",  # Added "yes"
     ]
-    
+
     # --- Logic ---
     # Check for non-entailment first, as it's a stronger signal.
     # This correctly handles cases like "Yes, but this is not entailment."
     if any(keyword in response_lower for keyword in not_entailment_keywords):
         return 1
-        
+
     # Then check for entailment, ensuring no negations are present.
-    if any(keyword in response_lower for keyword in entailment_keywords) and "not" not in response_lower:
+    if (
+        any(keyword in response_lower for keyword in entailment_keywords)
+        and "not" not in response_lower
+    ):
         return 0
-        
+
     # If neither of the above, the response is still considered invalid
     return -1
+
+
+def label_to_bool(label):
+    """Convert label integer to boolean."""
+    if label == 0:
+        return True  # Entailment
+    elif label == 1:
+        return False  # Not Entailment
+    else:
+        return None  # Invalid
+
 
 def run_experiment():
     # --- 0. Check for GPU ---
@@ -110,10 +103,11 @@ def run_experiment():
         )
 
     # --- 1. Configuration ---
-    model_name = model_names["qwen-7b-base"]
+    model_name = model_names["Meta-Llama-3.1-70B-Instruct-FP8"]
+    print(f"Loading model: {model_name}")
     prompt_path = "/scratch/pachary4/functional_competence/prompt_semantics/data/binary_NLI_prompts.csv"
     dataset_name = "rte"
-    num_shots_list, seeds = [32], [1]
+    num_shots_list, seeds = [0, 4, 16, 32], [1]
     # num_shots_list = [0, 4, 16]
     # seeds = [1, 2, 3]  # Use multiple seeds for robustness
     max_new_tokens = 10
@@ -123,9 +117,53 @@ def run_experiment():
 
     # --- 2. Load Model and Tokenizer ---
     # The from_pretrained method can handle both local paths and Hugging Face Hub IDs.
-    tokenizer = Qwen2Tokenizer.from_pretrained(
-        model_name, trust_remote_code=True
-    )
+    # Attempt to load tokenizer without trust_remote_code first to avoid config parsing issues
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=False
+        )
+    except (AttributeError, TypeError):
+        # Fallback: Manually load tokenizer.json and config to bypass transformers bug
+        # This happens when transformers fails to parse the config object correctly
+        try:
+            print(
+                "AutoTokenizer failed. Attempting manual load of PreTrainedTokenizerFast..."
+            )
+            tokenizer_file = os.path.join(model_name, "tokenizer.json")
+            config_file = os.path.join(model_name, "tokenizer_config.json")
+
+            # Load tokenizer without config first to avoid 'dict' attribute errors
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
+
+            # Manually apply essential config settings
+            if os.path.exists(config_file):
+                with open(config_file, "r") as f:
+                    config = json.load(f)
+
+                if "chat_template" in config:
+                    tokenizer.chat_template = config["chat_template"]
+                if "bos_token" in config:
+                    tokenizer.bos_token = config["bos_token"]
+                if "eos_token" in config:
+                    tokenizer.eos_token = config["eos_token"]
+                if "pad_token" in config:
+                    tokenizer.pad_token = config["pad_token"]
+
+            print("Loaded tokenizer manually using PreTrainedTokenizerFast.")
+        except Exception as manual_e:
+            print(
+                f"Manual load failed: {manual_e}. Retrying with trust_remote_code=True..."
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+    except Exception as e:
+        print(
+            f"Standard loading failed: {e}. Retrying with trust_remote_code=True..."
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, trust_remote_code=True
+        )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -218,7 +256,7 @@ def run_experiment():
                         premise=eval_example["sentence1"],
                         hypothesis=eval_example["sentence2"],
                     )
-                    prompt = f"{context}{eval_text}"
+                    prompt = f"{context}{eval_text} Answer: "
 
                     messages = [
                         {
@@ -274,9 +312,9 @@ def run_experiment():
                             "prompt_template": prompt_template,
                             "premise": eval_example["sentence1"],
                             "hypothesis": eval_example["sentence2"],
-                            "true_label": true_label,
+                            "true_label": label_to_bool(true_label),
                             "response": response,
-                            "predicted_label": predicted_label,
+                            "predicted_label": label_to_bool(predicted_label),
                             "adherent": adherent,
                             "correct": correct if adherent else None,
                         }
